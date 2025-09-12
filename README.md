@@ -64,7 +64,7 @@ python -m spacy download en_core_web_sm
 
 ## File Structure
 
-Being Updated
+Being Updated (EMNLP 2025)
 
 ### Command Line Usage
 

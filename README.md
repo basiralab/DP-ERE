@@ -6,7 +6,7 @@ DP-ERE introduces a novel syntactic filtering approach for entity relation extra
 
 ## Key Innovation
 
-The method is built on **Hypothesis 5.1**: *A true semantic relation between two entities is more likely to occur when the entities are close in the syntactic structure of a sentence, as measured by the shortest path in a dependency parse tree, regardless of their linear distance.*
+The method is built on a true semantic relation between two entities is more likely to occur when the entities are close in the syntactic structure of a sentence, as measured by the shortest path in a dependency parse tree, regardless of their linear distance.*
 
 ![DP-ERE Architecture](https://raw.githubusercontent.com/basiralab/DP-ERE/main/dp_ere_main_figure.png)
 

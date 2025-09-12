@@ -45,8 +45,10 @@ import timeit
 
 from tqdm import tqdm
 
-logger = logging.getLogger(__name__)
+# Import DP-ERE filter
+from dp_ere_filter import DPEREFilter, DPEREDatasetWrapper
 
+logger = logging.getLogger(__name__)
 
 ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in (BertConfig,  AlbertConfig)), ())
 
@@ -69,10 +71,28 @@ task_rel_labels = {
 }
 
 
-
-class ACEDataset(Dataset):
+class ACEDatasetWithDPFilter(Dataset):
     def __init__(self, tokenizer, args=None, evaluate=False, do_test=False, max_pair_length=None):
-        self.sentences_dict = {}  # Add this line to initialize the dictionary
+        self.sentences_dict = {}
+        
+        # Initialize DP-ERE filter
+        self.use_dp_filter = getattr(args, 'use_dp_filter', False)
+        if self.use_dp_filter:
+            distance_threshold = getattr(args, 'dp_distance_threshold', 4)
+            apply_during_training = getattr(args, 'dp_filter_train', False)
+            apply_during_inference = getattr(args, 'dp_filter_test', True)
+            spacy_model = getattr(args, 'dp_spacy_model', 'en_core_web_sm')
+            
+            self.dp_filter = DPEREFilter(
+                distance_threshold=distance_threshold,
+                spacy_model=spacy_model,
+                apply_during_training=apply_during_training,
+                apply_during_inference=apply_during_inference
+            )
+            logger.info(f"Initialized DP-ERE filter with threshold={distance_threshold}, "
+                       f"train_filter={apply_during_training}, test_filter={apply_during_inference}")
+        else:
+            self.dp_filter = None
 
         if not evaluate:
             file_path = os.path.join(args.data_dir, args.train_file)
@@ -104,6 +124,7 @@ class ACEDataset(Dataset):
         self.model_type = args.model_type
         self.no_sym = args.no_sym
 
+        # Initialize dataset-specific labels
         if args.data_dir.find('ace05')!=-1:
             self.ner_label_list = ['NIL', 'FAC', 'WEA', 'LOC', 'VEH', 'GPE', 'ORG', 'PER']
 
@@ -144,8 +165,63 @@ class ACEDataset(Dataset):
             assert (False)  
 
         self.global_predicted_ners = {}
+        
+        # DP-ERE filtering statistics
+        self.dp_filter_stats = {
+            'total_pairs': 0,
+            'filtered_pairs': 0,
+            'sentences_processed': 0
+        }
+        
         self.initialize()
    
+    def apply_dp_filter_to_entities(self, sentence_tokens, entities, is_training):
+        """
+        Apply DP-ERE filtering to entity pairs within a sentence.
+        
+        Args:
+            sentence_tokens: List of token strings
+            entities: List of (start, end, label) tuples
+            is_training: Whether this is during training
+            
+        Returns:
+            Set of valid entity pair indices
+        """
+        if not self.use_dp_filter or self.dp_filter is None:
+            # Return all possible pairs if filtering is disabled
+            valid_pairs = set()
+            for i in range(len(entities)):
+                for j in range(len(entities)):
+                    if i != j:
+                        valid_pairs.add((i, j))
+            return valid_pairs
+        
+        try:
+            # Convert entities to format expected by filter
+            entity_spans = [(start, end, label) for start, end, label in entities]
+            
+            # Apply filtering
+            valid_pairs = self.dp_filter.filter_entity_pairs(
+                sentence_tokens, entity_spans, is_training
+            )
+            
+            # Update statistics
+            self.dp_filter_stats['total_pairs'] += len(entities) * (len(entities) - 1)
+            self.dp_filter_stats['filtered_pairs'] += (len(entities) * (len(entities) - 1)) - len(valid_pairs)
+            self.dp_filter_stats['sentences_processed'] += 1
+            
+            return valid_pairs
+            
+        except Exception as e:
+            logger.warning(f"DP-ERE filtering failed: {e}")
+            # Return all pairs if filtering fails
+            valid_pairs = set()
+            for i in range(len(entities)):
+                for j in range(len(entities)):
+                    if i != j:
+                        valid_pairs.add((i, j))
+            return valid_pairs
+
     def initialize(self):
         tokenizer = self.tokenizer
         vocab_size = tokenizer.vocab_size
@@ -171,6 +247,7 @@ class ACEDataset(Dataset):
         self.golden_labels_withner = set([])
         maxR = 0
         maxL = 0
+        
         for l_idx, line in enumerate(f):
             data = json.loads(line)
 
@@ -179,7 +256,7 @@ class ACEDataset(Dataset):
                     break
 
             sentences = data['sentences']
-            if 'predicted_ner' in data:  # e2e predict
+            if 'predicted_ner' in data:
                 ners = data['predicted_ner']
             else:
                 ners = data['ner']
@@ -215,13 +292,14 @@ class ACEDataset(Dataset):
                 sentence_relations = relations[n]
                 std_ner = std_ners[n]
 
-                sentence_length = len(sentences[n])  # Number of tokens in the sentence
-                self.sentences_dict[(l_idx, n)] = sentences[n]  # Store sentence words
+                sentence_length = len(sentences[n])
+                sentence_tokens = sentences[n]  # Store original tokens for DP filtering
+                self.sentences_dict[(l_idx, n)] = sentence_tokens
 
                 std_entity_labels = {}
                 self.ner_tot_recall += len(std_ner)
 
-                # Process NER spans (no validation for range or bounds)
+                # Process NER spans
                 valid_ners = []
                 for start, end, label in sentence_ners:
                     valid_ners.append((start, end, label))
@@ -234,23 +312,23 @@ class ACEDataset(Dataset):
 
                 left_length = doc_sent_start
                 right_length = len(subwords) - doc_sent_end
-                sentence_length = doc_sent_end - doc_sent_start
-                half_context_length = int((max_num_subwords - sentence_length) / 2)
+                sentence_length_subwords = doc_sent_end - doc_sent_start
+                half_context_length = int((max_num_subwords - sentence_length_subwords) / 2)
 
-                if sentence_length < max_num_subwords:
+                if sentence_length_subwords < max_num_subwords:
                     if left_length < right_length:
                         left_context_length = min(left_length, half_context_length)
-                        right_context_length = min(right_length, max_num_subwords - left_context_length - sentence_length)
+                        right_context_length = min(right_length, max_num_subwords - left_context_length - sentence_length_subwords)
                     else:
                         right_context_length = min(right_length, half_context_length)
-                        left_context_length = min(left_length, max_num_subwords - right_context_length - sentence_length)
+                        left_context_length = min(left_length, max_num_subwords - right_context_length - sentence_length_subwords)
 
                 doc_offset = doc_sent_start - left_context_length
                 target_tokens = subwords[doc_offset: doc_sent_end + right_context_length]
                 target_tokens = [tokenizer.cls_token] + target_tokens[: self.max_seq_length - 4] + [tokenizer.sep_token]
                 assert(len(target_tokens) <= self.max_seq_length - 2)
 
-                # Process relation spans (no validation for range or bounds)
+                # Process relation spans
                 pos2label = {}
                 for x in sentence_relations:
                     pos2label[(x[0], x[1], x[2], x[3])] = label_map[x[4]]
@@ -273,11 +351,17 @@ class ACEDataset(Dataset):
                 if not self.evaluate:
                     entities.append((10000, 10000, 'NIL'))  # only for NER
 
-                for sub in entities:
+                # Apply DP-ERE filtering to determine valid entity pairs
+                is_training = not self.evaluate
+                valid_entity_pairs = self.apply_dp_filter_to_entities(
+                    sentence_tokens, entities, is_training
+                )
+
+                for sub_idx, sub in enumerate(entities):
                     cur_ins = []
 
                     if sub[0] < 10000:
-                        # Handle subword mapping, allowing invalid indices
+                        # Handle subword mapping
                         try:
                             sub_s = token2subword[sub[0]] - doc_offset + 1
                             sub_e = token2subword[sub[1] + 1] - doc_offset
@@ -305,10 +389,16 @@ class ACEDataset(Dataset):
                     if sub_e >= self.max_seq_length - 1:
                         continue
 
-                    for start, end, obj_label in valid_ners:
+                    for obj_idx, (start, end, obj_label) in enumerate(valid_ners):
                         if self.model_type.endswith('nersub'):
                             if start == sub[0] and end == sub[1]:
                                 continue
+
+                        # Apply DP-ERE filtering: only include entity pairs that passed the filter
+                        if self.use_dp_filter:
+                            pair_valid = (sub_idx, obj_idx) in valid_entity_pairs or (obj_idx, sub_idx) in valid_entity_pairs
+                            if not pair_valid:
+                                continue  # Skip this entity pair
 
                         try:
                             doc_entity_start = token2subword[start]
@@ -351,9 +441,20 @@ class ACEDataset(Dataset):
                             'sub': (sub, (sub_s, sub_e), sub_label),
                         }
                         self.data.append(item)
+        
+        # Log DP-ERE filtering statistics
+        if self.use_dp_filter and self.dp_filter_stats['sentences_processed'] > 0:
+            total_pairs = self.dp_filter_stats['total_pairs']
+            filtered_pairs = self.dp_filter_stats['filtered_pairs']
+            filter_rate = filtered_pairs / total_pairs if total_pairs > 0 else 0
+            logger.info(f"DP-ERE Filter Statistics:")
+            logger.info(f"  Sentences processed: {self.dp_filter_stats['sentences_processed']}")
+            logger.info(f"  Total entity pairs: {total_pairs}")
+            logger.info(f"  Filtered pairs: {filtered_pairs}")
+            logger.info(f"  Filter rate: {filter_rate:.2%}")
+            
         logger.info('maxR: %s', maxR)
         logger.info('maxL: %s', maxL)
-    
     
     def __len__(self):
         return len(self.data)
@@ -371,10 +472,10 @@ class ACEDataset(Dataset):
         
         if self.model_type.startswith('albert'):
             input_ids = input_ids + [30002] * (len(entry['examples'])) + [self.tokenizer.pad_token_id] * (self.max_pair_length - len(entry['examples']))
-            input_ids = input_ids + [30003] * (len(entry['examples'])) + [self.tokenizer.pad_token_id] * (self.max_pair_length - len(entry['examples'])) # for debug
+            input_ids = input_ids + [30003] * (len(entry['examples'])) + [self.tokenizer.pad_token_id] * (self.max_pair_length - len(entry['examples']))
         else:
             input_ids = input_ids + [3] * (len(entry['examples'])) + [self.tokenizer.pad_token_id] * (self.max_pair_length - len(entry['examples']))
-            input_ids = input_ids + [4] * (len(entry['examples'])) + [self.tokenizer.pad_token_id] * (self.max_pair_length - len(entry['examples'])) # for debug
+            input_ids = input_ids + [4] * (len(entry['examples'])) + [self.tokenizer.pad_token_id] * (self.max_pair_length - len(entry['examples']))
 
         labels = []
         ner_labels = []
@@ -415,7 +516,6 @@ class ACEDataset(Dataset):
                 input_ids[w1] = l_m
                 input_ids[w2] = r_m
 
-
         pair_L = len(entry['examples'])
         if self.args.att_left:
             attention_mask[self.max_seq_length : self.max_seq_length+pair_L, self.max_seq_length : self.max_seq_length+pair_L] = 1
@@ -448,12 +548,22 @@ class ACEDataset(Dataset):
         fields = [x for x in zip(*batch)]
 
         num_metadata_fields = 3
-        stacked_fields = [torch.stack(field) for field in fields[:-num_metadata_fields]]  # don't stack metadata fields
-        stacked_fields.extend(fields[-num_metadata_fields:])  # add them as lists not torch tensors
+        stacked_fields = [torch.stack(field) for field in fields[:-num_metadata_fields]]
+        stacked_fields.extend(fields[-num_metadata_fields:])
 
         return stacked_fields
 
- 
+    @staticmethod
+    def is_punctuation(char):
+        """Check if a character is punctuation."""
+        cp = ord(char)
+        if ((cp >= 33 and cp <= 47) or (cp >= 58 and cp <= 64) or
+            (cp >= 91 and cp <= 96) or (cp >= 123 and cp <= 126)):
+            return True
+        cat = unicodedata.category(char)
+        if cat.startswith("P"):
+            return True
+        return False
 
 
 def set_seed(args):
@@ -464,14 +574,12 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-
 def _rotate_checkpoints(args, checkpoint_prefix, use_mtime=False):
     if not args.save_total_limit:
         return
     if args.save_total_limit <= 0:
         return
 
-    # Check if we should delete older checkpoint(s)
     glob_checkpoints = glob.glob(os.path.join(args.output_dir, '{}-*'.format(checkpoint_prefix)))
     if len(glob_checkpoints) <= args.save_total_limit:
         return
@@ -500,7 +608,7 @@ def train(args, model, tokenizer):
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
 
-    train_dataset = ACEDataset(tokenizer=tokenizer, args=args, max_pair_length=args.max_pair_length)
+    train_dataset = ACEDatasetWithDPFilter(tokenizer=tokenizer, args=args, max_pair_length=args.max_pair_length)
 
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4*int(args.output_dir.find('test')==-1))
@@ -534,12 +642,10 @@ def train(args, model, tokenizer):
         except ImportError:
             raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
         model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
-    # ori_model = model
-    # multi-gpu training (should be after apex fp16 initialization)
+
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
 
-    # Distributed training (should be after apex fp16 initialization)
     if args.local_rank != -1:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank],
                                                           output_device=args.local_rank,
@@ -562,10 +668,8 @@ def train(args, model, tokenizer):
 
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
-    set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
+    set_seed(args)
     best_f1 = -1
-
-
 
     for _ in train_iterator:
         if args.shuffle and _ > 0:
@@ -583,7 +687,6 @@ def train(args, model, tokenizer):
                       'ner_labels':     batch[6],
                       }
 
-
             inputs['sub_positions'] = batch[3]
             if args.model_type.find('span')!=-1:
                 inputs['mention_pos'] = batch[4]
@@ -591,12 +694,12 @@ def train(args, model, tokenizer):
                 inputs['sub_ner_labels'] = batch[7]
 
             outputs = model(**inputs)
-            loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
+            loss = outputs[0]
             re_loss = outputs[1]
             ner_loss = outputs[2]
 
             if args.n_gpu > 1:
-                loss = loss.mean() # mean() to average on multi-gpu parallel training
+                loss = loss.mean()
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
                 re_loss = re_loss / args.gradient_accumulation_steps
@@ -614,7 +717,6 @@ def train(args, model, tokenizer):
             if ner_loss > 0:
                 tr_ner_loss += ner_loss.item()
 
-
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.max_grad_norm > 0:
                     if args.fp16:
@@ -623,15 +725,11 @@ def train(args, model, tokenizer):
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
                 optimizer.step()
-                scheduler.step()  # Update learning rate schedule
+                scheduler.step()
                 model.zero_grad()
                 global_step += 1
 
-                # if args.model_type.endswith('rel') :
-                #     ori_model.bert.encoder.layer[args.add_coref_layer].attention.self.relative_attention_bias.weight.data[0].zero_() # 可以手动乘个mask
-
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                    # Log metrics
                     tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
                     tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
                     logging_loss = tr_loss
@@ -642,11 +740,9 @@ def train(args, model, tokenizer):
                     tb_writer.add_scalar('NER_loss', (tr_ner_loss - logging_ner_loss)/args.logging_steps, global_step)
                     logging_ner_loss = tr_ner_loss
 
-
-                if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0: # valid for bert/spanbert
+                if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
                     update = True
-                    # Save model checkpoint
-                    if args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
+                    if args.evaluate_during_training:
                         results = evaluate(args, model, tokenizer)
                         f1 = results['f1_with_ner']
                         tb_writer.add_scalar('f1_with_ner', f1, global_step)
@@ -662,7 +758,7 @@ def train(args, model, tokenizer):
                         output_dir = os.path.join(args.output_dir, '{}-{}'.format(checkpoint_prefix, global_step))
                         if not os.path.exists(output_dir):
                             os.makedirs(output_dir)
-                        model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
+                        model_to_save = model.module if hasattr(model, 'module') else model
 
                         model_to_save.save_pretrained(output_dir)
 
@@ -681,7 +777,6 @@ def train(args, model, tokenizer):
     if args.local_rank in [-1, 0]:
         tb_writer.close()
 
-
     return global_step, tr_loss / global_step, best_f1
 
 def to_list(tensor):
@@ -690,7 +785,7 @@ def to_list(tensor):
 def evaluate(args, model, tokenizer, prefix="", do_test=False):
     eval_output_dir = args.output_dir
 
-    eval_dataset = ACEDataset(tokenizer=tokenizer, args=args, evaluate=True, do_test=do_test, max_pair_length=args.max_pair_length)
+    eval_dataset = ACEDatasetWithDPFilter(tokenizer=tokenizer, args=args, evaluate=True, do_test=do_test, max_pair_length=args.max_pair_length)
     golden_labels = set(eval_dataset.golden_labels)
     golden_labels_withner = set(eval_dataset.golden_labels_withner)
     label_list = list(eval_dataset.label_list)
@@ -712,7 +807,7 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
     model.eval()
 
     eval_sampler = SequentialSampler(eval_dataset)
-    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, collate_fn=ACEDataset.collate_fn, num_workers=4 * int(args.output_dir.find('test') == -1))
+    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, collate_fn=ACEDatasetWithDPFilter.collate_fn, num_workers=4 * int(args.output_dir.find('test') == -1))
 
     logger.info("  Num examples = %d", len(eval_dataset))
 
@@ -774,10 +869,8 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
     ner_ori_cor = 0
     tot_output_results = defaultdict(list)
 
-    # Add a list to collect wrong predictions
     wrong_predictions = []
     
-
     if not args.eval_unidirect:
         for example_index, pair_dict in sorted(scores.items(), key=lambda x: x[0]):
             visited = set([])
@@ -788,7 +881,7 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
                 v1 = list(v1)
                 m1 = k1[0]
                 m2 = k1[1]
-                if m1 == m2:  # Still filter identical spans
+                if m1 == m2:
                     continue
                 k2 = (m2, m1)
                 v2s = pair_dict.get(k2, None)
@@ -807,7 +900,7 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
                 pred_label = np.argmax(v1)
                 if pred_label > 0:
                     pred_score = v1[pred_label]
-                    if pred_score < -5.0:  # Retain confidence threshold
+                    if pred_score < -5.0:
                         continue
                     if pred_label >= num_label:
                         pred_label = pred_label - num_label + len(sym_labels)
@@ -892,7 +985,7 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
                 v1 = list(v1)
                 m1 = k1[0]
                 m2 = k1[1]
-                if m1 == m2:  # Still filter identical spans
+                if m1 == m2:
                     continue
                 pred_label = np.argmax(v1)
                 pred_score = v1[pred_label]
@@ -984,7 +1077,6 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
 
         wrong_by_type[pred_label].append((sentence, entity1, entity2, pred_label, true_relation))
 
-    
     total_printed = 0
     max_per_type = 5
     max_total = 20
@@ -1014,7 +1106,6 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
         output_w = open(os.path.join(args.output_dir, 'pred_results.json'), 'w')
         json.dump(tot_output_results, output_w)
 
-    # Log raw counts
     logger.info("cor_with_ner: %d", cor_with_ner)
     logger.info("tot_pred: %d", tot_pred)
     logger.info("tot_recall: %d", tot_recall)
@@ -1033,7 +1124,6 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
     assert(tot_recall == len(golden_labels_withner))
     rel_plus_f1 = 2 * (p_with_ner * r_with_ner) / (p_with_ner + r_with_ner) if cor_with_ner > 0 else 0.0
 
-    # Log precision and recall
     logger.info("Rel+ Precision: %.4f", p_with_ner)
     logger.info("Rel+ Recall: %.4f", r_with_ner)
     logger.info("Rel+ F1: %.4f", rel_plus_f1)
@@ -1045,6 +1135,7 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
     logger.info("Result: %s", json.dumps(results))
 
     return results
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -1144,6 +1235,18 @@ def main():
     parser.add_argument('--use_typemarker', action='store_true')
     parser.add_argument('--eval_unidirect', action='store_true')
 
+    # DP-ERE specific arguments
+    parser.add_argument('--use_dp_filter', action='store_true',
+                        help="Enable DP-ERE syntactic filtering")
+    parser.add_argument('--dp_distance_threshold', type=int, default=4,
+                        help="Maximum dependency path length for DP-ERE filter (δ parameter)")
+    parser.add_argument('--dp_filter_train', action='store_true',
+                        help="Apply DP-ERE filter during training (default: False)")
+    parser.add_argument('--dp_filter_test', action='store_true', default=True,
+                        help="Apply DP-ERE filter during inference (default: True)")
+    parser.add_argument('--dp_spacy_model', type=str, default='en_core_web_sm',
+                        help="SpaCy model for dependency parsing")
+
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
@@ -1164,12 +1267,10 @@ def main():
                 shutil.copyfile(script, dst_file)
 
     if args.do_train and args.local_rank in [-1, 0] and args.output_dir.find('test')==-1:
-        create_exp_dir(args.output_dir, scripts_to_save=['run_re.py', 'transformers/src/transformers/modeling_bert.py', 'transformers/src/transformers/modeling_albert.py'])
-
+        create_exp_dir(args.output_dir, scripts_to_save=['dp_ere_PL_Marker.py', 'dp_ere_filter.py'])
 
     # Setup distant debugging if needed
     if args.server_ip and args.server_port:
-        # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
         import ptvsd
         print("Waiting for debugger attach")
         ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
@@ -1179,7 +1280,7 @@ def main():
     if args.local_rank == -1 or args.no_cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
         args.n_gpu = torch.cuda.device_count()
-    else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+    else:
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
         torch.distributed.init_process_group(backend='nccl')
@@ -1196,16 +1297,38 @@ def main():
     # Set seed
     set_seed(args)
 
+    # Validate DP-ERE arguments
+    if args.use_dp_filter:
+        logger.info("DP-ERE filtering enabled with the following settings:")
+        logger.info(f"  Distance threshold: {args.dp_distance_threshold}")
+        logger.info(f"  Apply during training: {args.dp_filter_train}")
+        logger.info(f"  Apply during inference: {args.dp_filter_test}")
+        logger.info(f"  SpaCy model: {args.dp_spacy_model}")
+        
+        # Check if SpaCy model is available
+        try:
+            import spacy
+            spacy.load(args.dp_spacy_model)
+        except (ImportError, OSError) as e:
+            logger.error(f"SpaCy model '{args.dp_spacy_model}' not available: {e}")
+            logger.error(f"Please install it using: python -m spacy download {args.dp_spacy_model}")
+            if not args.dp_spacy_model == 'en_core_web_sm':
+                logger.info("Falling back to en_core_web_sm")
+                args.dp_spacy_model = 'en_core_web_sm'
+                try:
+                    spacy.load(args.dp_spacy_model)
+                except OSError:
+                    logger.error("Default SpaCy model not available. Disabling DP-ERE filtering.")
+                    args.use_dp_filter = False
+
     if args.data_dir.find('ace')!=-1:
         num_ner_labels = 8
-
         if args.no_sym:
             num_labels = 7 + 7 - 1
         else:
             num_labels = 7 + 7 - 2
     elif args.data_dir.find('scierc')!=-1:
         num_ner_labels = 7
-
         if args.no_sym:
             num_labels = 8 + 8 - 1
         else:
@@ -1215,8 +1338,7 @@ def main():
 
     # Load pretrained model and tokenizer
     if args.local_rank not in [-1, 0]:
-        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
-
+        torch.distributed.barrier()
 
     args.model_type = args.model_type.lower()
 
@@ -1231,15 +1353,12 @@ def main():
 
     model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path), config=config)
 
-
     if args.model_type.startswith('albert'):
         if args.use_typemarker:
             special_tokens_dict = {'additional_special_tokens': ['[unused' + str(x) + ']' for x in range(num_ner_labels*4+2)]}
         else:
             special_tokens_dict = {'additional_special_tokens': ['[unused' + str(x) + ']' for x in range(4)]}
         tokenizer.add_special_tokens(special_tokens_dict)
-        # print ('add tokens:', tokenizer.additional_special_tokens)
-        # print ('add ids:', tokenizer.additional_special_tokens_ids)
         model.albert.resize_token_embeddings(len(tokenizer))
 
     if args.do_train:
@@ -1272,26 +1391,24 @@ def main():
 
             word_embeddings[subs].copy_(word_embeddings[mask_id])     
             word_embeddings[sube].copy_(word_embeddings[subject_id])   
-
             word_embeddings[objs].copy_(word_embeddings[mask_id])      
             word_embeddings[obje].copy_(word_embeddings[object_id])     
 
     if args.local_rank == 0:
-        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+        torch.distributed.barrier()
 
     model.to(args.device)
 
     logger.info("Training/evaluation parameters %s", args)
     best_f1 = 0
+
     # Training
     if args.do_train:
-        # train_dataset = load_and_cache_examples(args,  tokenizer, evaluate=False)
         global_step, tr_loss, best_f1 = train(args, model, tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Saving best-practices: if you use defaults names for the model, you can reload it using from_pretrained()
     if args.do_train and (args.local_rank == -1 or torch.distributed.get_rank() == 0):
-        # Create output directory if needed
         if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
             os.makedirs(args.output_dir)
         update = True
@@ -1309,25 +1426,21 @@ def main():
             output_dir = os.path.join(args.output_dir, '{}-{}'.format(checkpoint_prefix, global_step))
             if not os.path.exists(output_dir):
                 os.makedirs(output_dir)
-            model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
+            model_to_save = model.module if hasattr(model, 'module') else model
 
             model_to_save.save_pretrained(output_dir)
-
             torch.save(args, os.path.join(output_dir, 'training_args.bin'))
             logger.info("Saving model checkpoint to %s", output_dir)
             _rotate_checkpoints(args, checkpoint_prefix)
 
         tokenizer.save_pretrained(args.output_dir)
-
         torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
-
 
     # Evaluation
     results = {'dev_best_f1': best_f1}
     if args.do_eval and args.local_rank in [-1, 0]:
 
         checkpoints = [args.output_dir]
-
         WEIGHTS_NAME = 'pytorch_model.bin'
 
         if args.eval_all_checkpoints:
@@ -1338,14 +1451,13 @@ def main():
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
 
             model = model_class.from_pretrained(checkpoint, config=config)
-
             model.to(args.device)
             result = evaluate(args, model, tokenizer, prefix=global_step, do_test=not args.no_test)
             result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
             results.update(result)
         print (results)
 
-        if args.no_test:  # choose best resutls on dev set
+        if args.no_test:
             bestv = 0
             k = 0
             for k, v in results.items():

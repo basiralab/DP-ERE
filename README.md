@@ -64,28 +64,7 @@ python -m spacy download en_core_web_sm
 
 ## File Structure
 
-```
-DP-ERE/
-├── src/
-│   ├── dp_ere_filter.py              # Core syntactic filtering implementation
-│   ├── dp_ere_PL_Marker.py           # DP-ERE with Positional Learning Markers
-│   ├── dependency_parser.py          # Dependency parsing utilities
-│   ├── entity_head_mapper.py         # Entity-to-head-token mapping
-│   └── utils.py                      # Helper functions
-├── data/
-│   ├── SciERC/                       # SciERC dataset
-│   ├── SciER/                        # SciER dataset  
-│   └── ACE05/                        # ACE05 dataset
-├── experiments/
-│   ├── baseline_comparison.py        # Baseline model comparisons
-│   ├── ablation_study.py             # Ablation experiments
-│   └── threshold_analysis.py         # Optimal threshold selection
-├── analysis/
-│   ├── distance_distribution.py     # Dependency distance analysis
-│   └── performance_metrics.py       # Evaluation utilities
-├── README.md
-└── requirements.txt
-```
+Being Updated
 
 ### Command Line Usage
 

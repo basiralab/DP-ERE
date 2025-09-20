@@ -62,9 +62,6 @@ python -m spacy download en_core_web_sm
 - NetworkX for graph operations
 - NumPy, Pandas for data processing
 
-## File Structure
-
-Being Updated (EMNLP 2025)
 
 ### Command Line Usage
 

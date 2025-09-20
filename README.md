@@ -98,14 +98,9 @@ Validated on multiple benchmark datasets:
 ### Statistical Evidence
 Empirical analysis demonstrates:
 - Scientific sentences can be exceptionally long (50+ tokens)
-- Ground-truth entity pairs predominantly have short dependency paths (≤4 edges)
+- Ground-truth entity pairs predominantly have short dependency paths (≤20 edges)
 - Linear distance is a poor proxy for semantic relatedness in complex sentences
 
-### Performance Improvements
-- **Precision**: 15-25% improvement over baseline methods
-- **Computational Efficiency**: 60-70% reduction in candidate pairs
-- **F1-Score**: Consistent improvements across all tested datasets
-- **Robustness**: Maintains recall while significantly boosting precision
 
 ## Integration with Existing Methods
 
